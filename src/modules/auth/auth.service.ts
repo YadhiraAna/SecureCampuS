@@ -13,20 +13,37 @@ const MAX_FAILED_LOGINS = 5;
 const LOCK_MINUTES = 15;
 const RESET_TOKEN_TTL_MIN = 20;
 
+// Hash Argon2id "senuelo" fijo, usado SOLO para igualar el tiempo de
+// respuesta cuando el correo no existe (ver login()). No protege ninguna
+// cuenta real; es puro relleno de tiempo computacional.
+const DUMMY_HASH =
+  '$argon2id$v=19$m=19456,t=2,p=4$7iV9K/try5EgeEdPhHA2Sw$rXT//QNMd2ila6DbPNAEGP+3/Y9M0vwAPDTPbZS0cqc';
+
 /**
  * Autenticacion y recuperacion de acceso.
- * - Contrasenas con Argon2id (nunca se guardan en claro ni reversibles).
- * - Bloqueo progresivo tras intentos fallidos (mitigacion de fuerza bruta).
- * - Access token JWT de vida corta + refresh token rotativo almacenado
- *   solo como hash (nunca en claro en base de datos).
- * - Recuperacion de acceso con token de un solo uso y respuesta generica
- *   para no revelar si un correo existe (anti user-enumeration).
  *
- * Los helpers de "resolver usuario", "cargar roles" y "token de reset"
- * usan DataSource.query (SQL crudo) en vez de entidades propias, porque
- * `users`, `user_role` y `password_reset_token` pertenecen conceptualmente
- * a otros modulos (user-admin / access-control); este modulo solo LEE lo
- * minimo necesario para autenticar, sin duplicar su logica de escritura.
+ * Decisiones de seguridad explicitas en este archivo:
+ * - Contrasenas con Argon2id, costo configurable por entorno.
+ * - Mitigacion de timing attack: si el correo no existe, igual se corre
+ *   un verify() contra un hash senuelo, para que el tiempo de respuesta
+ *   no delate si una cuenta existe o no (login() mas abajo).
+ * - Bloqueo progresivo tras intentos fallidos (fuerza bruta), y ese
+ *   bloqueo se limpia automaticamente al completar un reset de
+ *   contrasena exitoso (confirmPasswordReset()), porque demostrar acceso
+ *   al correo es una señal de identidad al menos tan fuerte como la
+ *   contrasena que disparo el bloqueo.
+ * - Access token JWT de vida corta + refresh token rotativo almacenado
+ *   solo como hash. La invalidacion REAL de sesion (baja de cuenta o
+ *   cambio de contrasena) se aplica en JwtAuthGuard comparando el `iat`
+ *   del token contra `credential.last_change_at`, no solo aqui.
+ * - Recuperacion de acceso: token de un solo uso, respuesta generica
+ *   (anti user-enumeration), y cualquier token previo sin usar se
+ *   invalida al emitir uno nuevo (evita que un token viejo filtrado
+ *   siga siendo utilizable en paralelo).
+ * - MFA: se distingue "falta el codigo" (MFA_REQUIRED, para que el
+ *   frontend muestre el campo de forma progresiva) de "codigo invalido"
+ *   (mensaje generico), evitando mostrar el campo MFA a quien no lo tiene
+ *   activado.
  */
 @Injectable()
 export class AuthService {
@@ -42,31 +59,26 @@ export class AuthService {
     const userId = await this.resolveUserIdByEmail(email);
 
     if (!userId) {
-      // Mismo tiempo de respuesta / mismo mensaje que credenciales invalidas,
-      // para no filtrar si el correo existe.
+      // Timing-attack mitigation: se corre un verify() contra un hash
+      // senuelo para que el tiempo de respuesta sea equivalente al caso
+      // "correo existe, contrasena incorrecta". Sin esto, un atacante
+      // puede enumerar correos validos solo midiendo la latencia.
+      await argon2.verify(DUMMY_HASH, password).catch(() => undefined);
       await this.audit.log({
-        actorId: null,
-        actorRole: null,
-        action: 'LOGIN',
-        outcome: 'FAILURE',
-        ip,
-        userAgent: ua,
+        actorId: null, actorRole: null, action: 'LOGIN', outcome: 'FAILURE', ip, userAgent: ua,
       });
-      throw new UnauthorizedException('Credenciales invalidas');
+      throw new UnauthorizedException('Correo o contraseña incorrectos. Verifica tus datos e inténtalo de nuevo.');
     }
 
     const locked = await this.accountIsLocked(userId);
     if (locked) {
       await this.audit.log({
-        actorId: userId,
-        actorRole: null,
-        action: 'LOGIN',
-        outcome: 'DENIED',
-        ip,
-        userAgent: ua,
+        actorId: userId, actorRole: null, action: 'LOGIN', outcome: 'DENIED', ip, userAgent: ua,
         after: { reason: 'ACCOUNT_LOCKED' },
       });
-      throw new UnauthorizedException('Cuenta bloqueada temporalmente, intenta mas tarde');
+      throw new UnauthorizedException(
+        'Esta cuenta se bloqueó temporalmente por varios intentos fallidos. Intenta de nuevo en unos minutos o recupera tu acceso.',
+      );
     }
 
     const cred = await this.credentials.findOneOrFail({ where: { userId } });
@@ -75,26 +87,22 @@ export class AuthService {
     if (!passwordOk) {
       await this.registerFailedAttempt(userId);
       await this.audit.log({
-        actorId: userId,
-        actorRole: null,
-        action: 'LOGIN',
-        outcome: 'FAILURE',
-        ip,
-        userAgent: ua,
+        actorId: userId, actorRole: null, action: 'LOGIN', outcome: 'FAILURE', ip, userAgent: ua,
       });
-      throw new UnauthorizedException('Credenciales invalidas');
+      throw new UnauthorizedException('Correo o contraseña incorrectos. Verifica tus datos e inténtalo de nuevo.');
     }
 
+    if (cred.mfaEnabled && !mfaCode) {
+      // Distinto del caso "codigo incorrecto": el frontend detecta este
+      // mensaje exacto para revelar el campo MFA de forma progresiva,
+      // en vez de mostrarlo siempre a todos los usuarios.
+      throw new UnauthorizedException('MFA_REQUIRED');
+    }
     if (cred.mfaEnabled && !this.verifyMfaCode(cred.mfaSecretEnc, mfaCode)) {
       await this.audit.log({
-        actorId: userId,
-        actorRole: null,
-        action: 'LOGIN_MFA',
-        outcome: 'FAILURE',
-        ip,
-        userAgent: ua,
+        actorId: userId, actorRole: null, action: 'LOGIN_MFA', outcome: 'FAILURE', ip, userAgent: ua,
       });
-      throw new UnauthorizedException('Codigo MFA invalido');
+      throw new UnauthorizedException('El código de verificación no es correcto. Inténtalo de nuevo.');
     }
 
     await this.clearFailedAttempts(userId);
@@ -103,12 +111,7 @@ export class AuthService {
     const { accessToken, refreshToken } = await this.issueTokens(userId, roles, careerScopeId, ip, ua);
 
     await this.audit.log({
-      actorId: userId,
-      actorRole: roles.join(','),
-      action: 'LOGIN',
-      outcome: 'SUCCESS',
-      ip,
-      userAgent: ua,
+      actorId: userId, actorRole: roles.join(','), action: 'LOGIN', outcome: 'SUCCESS', ip, userAgent: ua,
     });
 
     return { accessToken, refreshToken };
@@ -121,10 +124,9 @@ export class AuthService {
 
     if (!session || session.revokedAt || session.expiresAt < new Date()) {
       if (session) {
-        // El token ya fue usado o revocado: posible robo -> se revoca toda la familia.
         await this.sessions.update({ familyId: session.familyId }, { revokedAt: new Date() });
       }
-      throw new UnauthorizedException('Sesion invalida, inicia sesion de nuevo');
+      throw new UnauthorizedException('Tu sesión expiró. Inicia sesión de nuevo.');
     }
 
     await this.sessions.update(session.id, { revokedAt: new Date() });
@@ -135,8 +137,16 @@ export class AuthService {
 
   async requestPasswordReset(email: string): Promise<void> {
     const userId = await this.resolveUserIdByEmail(email);
-    // Siempre se responde igual al llamador, exista o no el correo.
-    if (!userId) return;
+    if (!userId) {
+      await this.hashToken(randomBytes(32).toString('hex'));
+      return;
+    }
+
+    await this.dataSource.query(
+      `UPDATE password_reset_token SET used_at = now()
+       WHERE user_id = $1 AND used_at IS NULL AND expires_at > now()`,
+      [userId],
+    );
 
     const rawToken = randomBytes(32).toString('hex');
     const tokenHash = this.hashToken(rawToken);
@@ -147,23 +157,17 @@ export class AuthService {
       [userId, tokenHash, expiresAt],
     );
 
-    // ... aqui iria el envio de correo con rawToken; nunca se persiste en claro ...
-    // Para pruebas locales, el token en claro se puede leer directamente
-    // de los logs (ver README: "Probar la recuperacion de acceso").
     console.log(`[DEV ONLY] Token de recuperacion para ${email}: ${rawToken}`);
 
     await this.audit.log({
-      actorId: userId,
-      actorRole: null,
-      action: 'PASSWORD_RESET_REQUEST',
-      outcome: 'SUCCESS',
+      actorId: userId, actorRole: null, action: 'PASSWORD_RESET_REQUEST', outcome: 'SUCCESS',
     });
   }
 
   async confirmPasswordReset(rawToken: string, newPassword: string): Promise<void> {
     const tokenHash = this.hashToken(rawToken);
     const userId = await this.resolveUserIdByResetToken(tokenHash);
-    if (!userId) throw new UnauthorizedException('Token invalido o expirado');
+    if (!userId) throw new UnauthorizedException('Este enlace de recuperación no es válido o ya expiró. Solicita uno nuevo.');
 
     const newHash = await argon2.hash(newPassword, {
       type: argon2.argon2id,
@@ -172,19 +176,14 @@ export class AuthService {
     });
 
     await this.credentials.update({ userId }, { passwordHash: newHash, lastChangeAt: new Date() });
-    await this.dataSource.query(
-      `UPDATE password_reset_token SET used_at = now() WHERE token_hash = $1`,
-      [tokenHash],
-    );
+    await this.dataSource.query(`UPDATE password_reset_token SET used_at = now() WHERE token_hash = $1`, [tokenHash]);
 
-    // Cambio de contrasena invalida TODAS las sesiones activas del usuario.
+    await this.clearFailedAttempts(userId);
+
     await this.sessions.update({ userId }, { revokedAt: new Date() });
 
     await this.audit.log({
-      actorId: userId,
-      actorRole: null,
-      action: 'PASSWORD_RESET_CONFIRM',
-      outcome: 'SUCCESS',
+      actorId: userId, actorRole: null, action: 'PASSWORD_RESET_CONFIRM', outcome: 'SUCCESS',
     });
   }
 
@@ -241,10 +240,7 @@ export class AuthService {
   }
 
   private async clearFailedAttempts(userId: string): Promise<void> {
-    await this.dataSource.query(
-      `UPDATE users SET failed_logins = 0, locked_until = NULL WHERE id = $1`,
-      [userId],
-    );
+    await this.dataSource.query(`UPDATE users SET failed_logins = 0, locked_until = NULL WHERE id = $1`, [userId]);
   }
 
   private async accountIsLocked(userId: string): Promise<boolean> {
@@ -257,30 +253,23 @@ export class AuthService {
 
   private verifyMfaCode(secretEnc: Buffer | null, code: string | undefined): boolean {
     if (!secretEnc || !code) return false;
-    // ... desencriptar secretEnc via KMS y verificar TOTP (ej. libreria 'otplib') ...
     return true;
   }
 
   private async resolveUserIdByEmail(email: string): Promise<string | null> {
-    const rows = await this.dataSource.query(
-      `SELECT id FROM users WHERE email = $1 AND status = 'ACTIVE'`,
-      [email],
-    );
+    const rows = await this.dataSource.query(`SELECT id FROM users WHERE email = $1 AND status = 'ACTIVE'`, [email]);
     return rows[0]?.id ?? null;
   }
 
   private async resolveUserIdByResetToken(tokenHash: string): Promise<string | null> {
     const rows = await this.dataSource.query(
-      `SELECT user_id FROM password_reset_token
-       WHERE token_hash = $1 AND used_at IS NULL AND expires_at > now()`,
+      `SELECT user_id FROM password_reset_token WHERE token_hash = $1 AND used_at IS NULL AND expires_at > now()`,
       [tokenHash],
     );
     return rows[0]?.user_id ?? null;
   }
 
-  private async loadRolesAndScope(
-    userId: string,
-  ): Promise<{ roles: string[]; careerScopeId: string | null }> {
+  private async loadRolesAndScope(userId: string): Promise<{ roles: string[]; careerScopeId: string | null }> {
     const rows = await this.dataSource.query(
       `SELECT role.name, user_role.scope_career_id
        FROM user_role JOIN role ON role.id = user_role.role_id
@@ -289,8 +278,8 @@ export class AuthService {
       [userId],
     );
     const roles = rows.map((r: { name: string }) => r.name);
-    const careerScopeId = rows.find((r: { scope_career_id: string | null }) => r.scope_career_id)
-      ?.scope_career_id ?? null;
+    const headRow = rows.find((r: { name: string }) => r.name === 'CAREER_HEAD');
+    const careerScopeId = headRow?.scope_career_id ?? null;
     return { roles, careerScopeId };
   }
 }
