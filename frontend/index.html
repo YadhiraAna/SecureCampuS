@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SecureCampus</title>
+  <link rel="stylesheet" href="/app/styles.css" />
+</head>
+<body>
+
+  <!-- ===================== PANTALLA DE INICIO DE SESION ===================== -->
+  <div id="view-login" class="auth-screen">
+    <div class="auth-card">
+      <div class="auth-brand">
+        <span class="auth-brand-mark" aria-hidden="true"></span>
+        <h1>SecureCampus</h1>
+      </div>
+      <p class="auth-subtitle">Sistema de gestión académica</p>
+
+      <form id="login-form" class="auth-form">
+        <label>
+          Correo institucional
+          <input type="email" id="login-email" required autocomplete="username" placeholder="nombre@securecampus.test" />
+        </label>
+        <label>
+          Contraseña
+          <input type="password" id="login-password" required autocomplete="current-password" placeholder="••••••••" />
+        </label>
+        <div id="login-mfa-wrap" class="hidden">
+          <label>
+            Código de verificación (MFA)
+            <input type="text" id="login-mfa" inputmode="numeric" placeholder="000000" />
+          </label>
+        </div>
+
+        <button type="submit" class="btn btn-primary btn-block">Iniciar sesión</button>
+        <button type="button" id="goto-forgot" class="btn btn-link">¿Olvidaste tu contraseña?</button>
+      </form>
+
+      <p id="login-error" class="form-error hidden"></p>
+    </div>
+  </div>
+
+  <!-- ===================== RECUPERACION DE ACCESO ===================== -->
+  <div id="view-forgot" class="auth-screen hidden">
+    <div class="auth-card">
+      <div class="auth-brand">
+        <span class="auth-brand-mark" aria-hidden="true"></span>
+        <h1>Recuperar acceso</h1>
+      </div>
+
+      <form id="forgot-request-form" class="auth-form">
+        <p class="auth-help">Ingresa tu correo. Si existe una cuenta, se enviarán instrucciones.</p>
+        <label>
+          Correo institucional
+          <input type="email" id="forgot-email" required />
+        </label>
+        <button type="submit" class="btn btn-primary btn-block">Enviar instrucciones</button>
+      </form>
+
+      <form id="forgot-confirm-form" class="auth-form hidden">
+        <p class="auth-help">Pega el token recibido (en este entorno de pruebas aparece en la consola del servidor) y define una nueva contraseña.</p>
+        <label>
+          Token
+          <input type="text" id="forgot-token" required />
+        </label>
+        <label>
+          Nueva contraseña
+          <input type="password" id="forgot-newpassword" required minlength="12" />
+        </label>
+        <button type="submit" class="btn btn-primary btn-block">Restablecer contraseña</button>
+      </form>
+
+      <button type="button" id="back-to-login" class="btn btn-link">Volver a inicio de sesión</button>
+      <p id="forgot-message" class="form-note hidden"></p>
+    </div>
+  </div>
+
+  <!-- ===================== APP PRINCIPAL (POST-LOGIN) ===================== -->
+  <div id="view-app" class="app-shell hidden">
+    <aside class="sidebar">
+      <div class="sidebar-brand">
+        <span class="auth-brand-mark" aria-hidden="true"></span>
+        <span>SecureCampus</span>
+      </div>
+
+      <nav id="sidebar-nav" class="sidebar-nav"></nav>
+
+      <div class="sidebar-footer">
+        <div class="user-chip">
+          <span id="user-chip-initial" class="user-chip-avatar"></span>
+          <div class="user-chip-info">
+            <strong id="user-chip-name">—</strong>
+            <span id="user-chip-role">—</span>
+          </div>
+        </div>
+        <button id="logout-btn" class="btn btn-ghost btn-block">Cerrar sesión</button>
+      </div>
+    </aside>
+
+    <main class="main-content">
+      <header class="content-header">
+        <h2 id="content-title">Panel</h2>
+      </header>
+      <section id="content-body" class="content-body"></section>
+    </main>
+  </div>
+
+  <!-- Contenedor de notificaciones -->
+  <div id="toast-container" class="toast-container"></div>
+
+  <script src="/app/app.js"></script>
+</body>
+</html>
